@@ -1,0 +1,488 @@
+-- Payback UI Library v7.5
+-- • Blur strip under tabs (glass look)
+-- • UI + Config tabs are always provided by the library
+-- • All settings OFF by default unless an autoload config exists
+-- • X button hides, explicit Unload button removes UI & blur
+-- • FPS HUD, search, color picker with Apply, save/load/delete configs
+
+--// Services
+local Players            = game:GetService("Players")
+local TweenService       = game:GetService("TweenService")
+local UserInputService   = game:GetService("UserInputService")
+local RunService         = game:GetService("RunService")
+local TextService        = game:GetService("TextService")
+local HttpService        = game:GetService("HttpService")
+local Lighting           = game:GetService("Lighting")
+local Workspace          = game:GetService("Workspace")
+
+local LP = Players.LocalPlayer
+
+-- globals bucket for external scripts (kept separate from this module’s internals)
+getgenv().Payback = getgenv().Payback or { Toggles = {}, Options = {}, Unloaded = false }
+
+-- helpers
+local function GuiParent()
+    local ok, gui = pcall(function() return gethui and gethui() end)
+    if ok and typeof(gui) == "Instance" then return gui end
+    return game:FindFirstChildOfClass("CoreGui") or LP:WaitForChild("PlayerGui")
+end
+local function inst(class, props)
+    local o = Instance.new(class)
+    for k,v in pairs(props or {}) do if k~="Parent" then o[k]=v end end
+    if props and props.Parent then o.Parent = props.Parent end
+    return o
+end
+local function alive(x) return typeof(x)=="Instance" and x.Parent~=nil end
+local function textW(t, size, font) return TextService:GetTextSize(t or "", size or 14, font or Enum.Font.Gotham, Vector2.new(2048,1024)).X end
+local function darker(c) local h,s,v=Color3.toHSV(c); return Color3.fromHSV(h,s,math.clamp(v*0.74,0,1)) end
+local function safeTween(obj,t,props,style,dir)
+    if not alive(obj) then return end
+    local info = TweenInfo.new(t or .22, style or Enum.EasingStyle.Quad, dir or Enum.EasingDirection.Out)
+    local ok, tw = pcall(TweenService.Create, TweenService, obj, info, props)
+    if ok and tw then tw:Play(); return tw end
+end
+local function ripple(btn, pos)
+    if not alive(btn) then return end
+    local m = UserInputService:GetMouseLocation()
+    local mx,my = m.X,m.Y
+    if typeof(pos)=="Vector2" then mx,my=pos.X,pos.Y end
+    local lx=math.clamp(mx-btn.AbsolutePosition.X,0,btn.AbsoluteSize.X)
+    local ly=math.clamp(my-btn.AbsolutePosition.Y,0,btn.AbsoluteSize.Y)
+    local d=math.max(btn.AbsoluteSize.X,btn.AbsoluteSize.Y)*1.6
+    local r=inst("Frame",{BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=.8,AnchorPoint=Vector2.new(.5,.5),Position=UDim2.fromOffset(lx,ly),Size=UDim2.fromOffset(0,0),Parent=btn,ZIndex=(btn.ZIndex or 1)+1,ClipsDescendants=true})
+    inst("UICorner",{CornerRadius=UDim.new(1,0),Parent=r})
+    local tw=safeTween(r,.33,{Size=UDim2.fromOffset(d,d),BackgroundTransparency=1}); if tw then tw.Completed:Connect(function() if r then r:Destroy() end end) else task.delay(.34,function() if r then r:Destroy() end end) end
+end
+
+local function defaultTheme()
+    return {
+        Background  = Color3.fromRGB(16,20,28),
+        Panel       = Color3.fromRGB(22,26,36),
+        Panel2      = Color3.fromRGB(28,34,46),
+        Stroke      = Color3.fromRGB(56,72,96),
+        TextPrimary = Color3.fromRGB(242,246,255),
+        TextMuted   = Color3.fromRGB(170,182,198),
+        Accent      = Color3.fromRGB(0,186,255)
+    }
+end
+
+-- Config manager (filesystem helpers)
+local Config = {}; Config.__index=Config
+function Config.new(dir) return setmetatable({Directory=dir or "Payback-UI", Values={}, Setters={}},Config) end
+function Config:Set(k,v) if k and k~="" then self.Values[k]=v end end
+function Config:Bind(k,fn) if k and k~="" then self.Setters[k]=fn end end
+function Config:Save(name)
+    if not (writefile and isfolder and makefolder) then return false,"filesystem unavailable" end
+    if not isfolder(self.Directory) then pcall(makefolder,self.Directory) end
+    local ok,json = pcall(HttpService.JSONEncode,HttpService,self.Values); if not ok then return false,"encode failed" end
+    pcall(writefile, ("%s/%s.json"):format(self.Directory, name or "default"), json); return true
+end
+function Config:Load(name)
+    if not (isfile and readfile) then return false,"filesystem unavailable" end
+    local path=("%s/%s.json"):format(self.Directory, name or "default"); if not isfile(path) then return false,"no file" end
+    local ok,t=pcall(function() return HttpService:JSONDecode(readfile(path)) end); if not ok then return false,"decode failed" end
+    self.Values=t or self.Values; for k,fn in pairs(self.Setters) do if self.Values[k]~=nil then pcall(fn,self.Values[k]) end end; return true
+end
+
+-- small notifier + fps HUD
+local function createNotifier(screen,theme)
+    local holder=inst("Frame",{BackgroundTransparency=1,AnchorPoint=Vector2.new(1,1),Position=UDim2.new(1,-16,1,-16),Size=UDim2.fromOffset(360,280),Parent=screen,ZIndex=300})
+    inst("UIListLayout",{Parent=holder,Padding=UDim.new(0,8)})
+    return function(o)
+        o=o or {}; local dur=tonumber(o.Duration) or 4
+        local card=inst("Frame",{BackgroundColor3=theme.Panel2,BackgroundTransparency=.06,Size=UDim2.new(1,0,0,74),Parent=holder,ZIndex=301})
+        inst("UICorner",{CornerRadius=UDim.new(0,10),Parent=card})
+        inst("UIStroke",{ApplyStrokeMode=Enum.ApplyStrokeMode.Border,Color=theme.Stroke,Thickness=1,Transparency=.2,Parent=card})
+        inst("Frame",{BackgroundColor3=theme.Accent,BorderSizePixel=0,Size=UDim2.new(0,3,1,0),Parent=card,ZIndex=302})
+        inst("TextLabel",{BackgroundTransparency=1,Text=o.Title or "Payback",Font=Enum.Font.GothamBold,TextSize=16,TextColor3=theme.TextPrimary,TextXAlignment=Enum.TextXAlignment.Left,Position=UDim2.fromOffset(12,6),Size=UDim2.fromOffset(320,20),Parent=card,ZIndex=303})
+        inst("TextLabel",{BackgroundTransparency=1,Text=o.Content or "",Font=Enum.Font.Gotham,TextSize=14,TextColor3=theme.TextMuted,TextWrapped=true,TextXAlignment=Enum.TextXAlignment.Left,Position=UDim2.fromOffset(12,28),Size=UDim2.new(1,-24,0,36),Parent=card,ZIndex=303})
+        card.Position=UDim2.new(1,380,0,0); safeTween(card,.32,{Position=UDim2.new(0,0,0,0)},Enum.EasingStyle.Quint)
+        local bar=inst("Frame",{BackgroundColor3=theme.Accent,BackgroundTransparency=.3,Size=UDim2.new(1,0,0,3),Position=UDim2.new(0,0,1,-3),Parent=card,ZIndex=304})
+        inst("UICorner",{CornerRadius=UDim.new(0,2),Parent=bar})
+        local tw=safeTween(bar,dur,{Size=UDim2.new(0,0,0,3)}); if tw then tw.Completed:Connect(function()
+            safeTween(card,.18,{BackgroundTransparency=1}); local t2=safeTween(card,.2,{Position=UDim2.new(1,380,0,0)}); if t2 then t2.Completed:Connect(function() if card then card:Destroy() end end) else task.delay(.22,function() if card then card:Destroy() end end) end
+        end) end
+    end
+end
+local function createWatermark(screen,theme)
+    local wm=inst("TextLabel",{BackgroundColor3=theme.Panel,BackgroundTransparency=.42,Text="Payback",Font=Enum.Font.GothamBold,TextSize=12,TextColor3=theme.TextPrimary,Position=UDim2.fromOffset(12,12),Size=UDim2.fromOffset(170,22),Parent=screen,ZIndex=120,Visible=false})
+    inst("UICorner",{CornerRadius=UDim.new(0,8),Parent=wm})
+    inst("UIStroke",{ApplyStrokeMode=Enum.ApplyStrokeMode.Border,Color=theme.Stroke,Thickness=1,Transparency=.24,Parent=wm})
+    local aliveFlag=true; task.spawn(function() while aliveFlag and alive(wm) do local frames,t0=0,os.clock(); repeat frames+=1; RunService.RenderStepped:Wait() until os.clock()-t0>=1; if wm.Visible and alive(wm) then wm.Text=string.format("Payback • %d FPS",frames) end end end)
+    return { Show=function(_,b) if alive(wm) then wm.Visible=b and true or false end end, Destroy=function(_) aliveFlag=false; if wm then wm:Destroy() end end }
+end
+
+-- Control kit (Toggle/Slider/Textbox/Dropdown/ColorPicker/Button)
+local ControlKit={}; ControlKit.__index=ControlKit
+local function register(tbl,flag,payload) if flag and flag~="" then tbl[flag]=payload end end
+local function spring(uiobj) if not alive(uiobj) then return end local s=uiobj:FindFirstChild("__PBScale") or inst("UIScale",{Name="__PBScale",Parent=uiobj,Scale=1}); local a=safeTween(s,.08,{Scale=1.04}); if a then a.Completed:Connect(function() if alive(s) then safeTween(s,.14,{Scale=1}) end end) end end
+function ControlKit.new(container,theme,config,env,registry,screen,indexer) return setmetatable({Holder=container,Theme=theme,Config=config,Env=env,Registry=registry,Screen=screen,Indexer=indexer},ControlKit) end
+function ControlKit:_row(h) local r=inst("Frame",{BackgroundColor3=self.Theme.Panel2,BackgroundTransparency=.06,Size=UDim2.new(1,0,0,h),Parent=self.Holder,ZIndex=self.Holder.ZIndex+1,ClipsDescendants=true}); inst("UICorner",{CornerRadius=UDim.new(0,10),Parent=r}); inst("UIStroke",{ApplyStrokeMode=Enum.ApplyStrokeMode.Border,Color=self.Theme.Stroke,Thickness=1,Transparency=.22,Parent=r}); r.MouseEnter:Connect(function() spring(r) end); return r end
+function ControlKit:Button(o) o=o or {}; local row=self:_row(self.Env.RowH); inst("TextLabel",{BackgroundTransparency=1,Text=o.Name or "Button",Font=Enum.Font.GothamMedium,TextSize=self.Env.Font,TextColor3=self.Theme.TextPrimary,TextXAlignment=Enum.TextXAlignment.Left,Position=UDim2.fromOffset(self.Env.BodyPadX,0),Size=UDim2.new(1,-self.Env.BodyPadX*2,1,0),Parent=row,ZIndex=row.ZIndex+1}); row.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then ripple(row,i.Position); task.spawn(o.Callback or function() end) end end); if self.Indexer then self.Indexer(o.Name or "Button",row) end; return {Instance=row} end
+function ControlKit:Toggle(o) o=o or {}; local text,flag=o.Name or "Toggle",o.Flag; local state=o.Default==true; local callbacks={}; local row=self:_row(self.Env.RowH); inst("TextLabel",{BackgroundTransparency=1,Text=text,Font=Enum.Font.GothamMedium,TextSize=self.Env.Font,TextColor3=self.Theme.TextPrimary,TextXAlignment=Enum.TextXAlignment.Left,Position=UDim2.fromOffset(self.Env.BodyPadX,0),Size=UDim2.new(1,-(self.Env.BodyPadX*2 + self.Env.TogW + 18),1,0),Parent=row,ZIndex=row.ZIndex+1}); local box=inst("Frame",{BackgroundColor3=state and self.Theme.Accent or Color3.fromRGB(66,72,86),BackgroundTransparency=.08,AnchorPoint=Vector2.new(1,.5),Position=UDim2.new(1,-self.Env.BodyPadX,.5,0),Size=UDim2.fromOffset(self.Env.TogW,self.Env.TogH),Parent=row,ZIndex=row.ZIndex+1}); inst("UICorner",{CornerRadius=UDim.new(1,0),Parent=box}); inst("UIStroke",{ApplyStrokeMode=Enum.ApplyStrokeMode.Border,Color=self.Theme.Stroke,Thickness=1,Transparency=.25,Parent=box}); local knob=inst("Frame",{BackgroundColor3=Color3.fromRGB(252,252,255),AnchorPoint=Vector2.new(.5,.5),Position=UDim2.fromOffset(state and (self.Env.TogW-self.Env.KnobInset) or self.Env.KnobInset, math.floor(self.Env.TogH/2)),Size=UDim2.fromOffset(self.Env.Knob,self.Env.Knob),Parent=box,ZIndex=box.ZIndex+1}); inst("UICorner",{CornerRadius=UDim.new(1,0),Parent=knob})
+    local function fire(v) if o.Callback then task.spawn(o.Callback,v) end for _,fn in ipairs(callbacks) do task.spawn(fn,v) end end
+    local function apply(v,fromLoad) state=v and true or false; safeTween(knob,.14,{Position=UDim2.fromOffset(state and (self.Env.TogW-self.Env.KnobInset) or self.Env.KnobInset, math.floor(self.Env.TogH/2))}); safeTween(box,.14,{BackgroundColor3=state and self.Theme.Accent or Color3.fromRGB(66,72,86)}); self.Config:Set(flag or "", state); if not fromLoad then fire(state) end end
+    row.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then ripple(row,i.Position); apply(not state) end end)
+    if flag then self.Config:Bind(flag,function(v) apply(v,true) end); self.Config:Set(flag,state); register(getgenv().Payback.Toggles,flag,{Value=state,SetValue=function(_,v) apply(v) end,OnChanged=function(_,fn) table.insert(callbacks,fn); fn(state) end}) end
+    if self.Indexer then self.Indexer(text,row) end; return {Instance=row} end
+function ControlKit:Slider(o) o=o or {}; local text,min,max,step=o.Name or "Slider",tonumber(o.Min or 0),tonumber(o.Max or 100),tonumber(o.Step or 1); local def,flag=tonumber(o.Default or min),o.Flag; local callbacks={}; local val=math.clamp(def,min,max); local row=self:_row(self.Env.RowH+10); local label=inst("TextLabel",{BackgroundTransparency=1,Text=("%s: %s"):format(text,tostring(val)),Font=Enum.Font.GothamMedium,TextSize=self.Env.Font,TextColor3=self.Theme.TextPrimary,TextXAlignment=Enum.TextXAlignment.Left,Position=UDim2.fromOffset(self.Env.BodyPadX,4),Size=UDim2.new(1,-self.Env.BodyPadX*2,0,self.Env.Font+4),Parent=row,ZIndex=row.ZIndex+1}); local track=inst("Frame",{BackgroundColor3=Color3.fromRGB(64,70,84),BackgroundTransparency=.12,Position=UDim2.new(0,self.Env.BodyPadX,0,self.Env.RowH - math.floor(self.Env.SliderH/2)+2),Size=UDim2.new(1,-(self.Env.BodyPadX*2 + self.Env.RowExtra),0,self.Env.SliderH),Parent=row,ZIndex=row.ZIndex+1}); inst("UICorner",{CornerRadius=UDim.new(0,math.floor(self.Env.SliderH/2)),Parent=track}); inst("UIStroke",{ApplyStrokeMode=Enum.ApplyStrokeMode.Border,Color=self.Theme.Stroke,Thickness=1,Transparency=.25,Parent=track}); local fill=inst("Frame",{BackgroundColor3=self.Theme.Accent,Size=UDim2.new((val-min)/math.max(1,(max-min)),0,1,0),Parent=track,ZIndex=track.ZIndex+1}); inst("UICorner",{CornerRadius=UDim.new(0,math.floor(self.Env.SliderH/2)),Parent=fill})
+    local function fire(v) if o.Callback then task.spawn(o.Callback,v) end for _,f in ipairs(callbacks) do task.spawn(f,v) end end
+    local function setDirect(v) val=math.clamp((tonumber(v) or val),min,max); label.Text=("%s: %s"):format(text,tostring(val)); safeTween(fill,.10,{Size=UDim2.new((val-min)/math.max(1,(max-min)),0,1,0)}); self.Config:Set(flag or "", val); fire(val) end
+    local dragging=false; track.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then dragging=true end end)
+    track.InputEnded:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then dragging=false end end)
+    UserInputService.InputChanged:Connect(function(i) if dragging and (i.UserInputType==Enum.UserInputType.MouseMovement or i.UserInputType==Enum.UserInputType.Touch) then local p=math.clamp((i.Position.X-track.AbsolutePosition.X)/math.max(1,track.AbsoluteSize.X),0,1); setDirect(min+(max-min)*p) end end)
+    if flag then self.Config:Bind(flag,function(v) setDirect(v) end); self.Config:Set(flag,val); register(getgenv().Payback.Options,flag,{Value=val,SetValue=function(_,v) setDirect(v) end,OnChanged=function(_,fn) table.insert(callbacks,fn); fn(val) end}) end
+    if self.Indexer then self.Indexer(text,row) end; return {Instance=row} end
+function ControlKit:Textbox(o) o=o or {}; local text,ph,flag=o.Name or "Textbox",o.Placeholder or "Type…",o.Flag; local callbacks={}; local value=""; local row=self:_row(self.Env.RowH); inst("TextLabel",{BackgroundTransparency=1,Text=text,Font=Enum.Font.GothamMedium,TextSize=self.Env.Font,TextColor3=self.Theme.TextPrimary,TextXAlignment=Enum.TextXAlignment.Left,Position=UDim2.fromOffset(self.Env.BodyPadX,0),Size=UDim2.new(1,-self.Env.BodyPadX*2,1,0),Parent=row,ZIndex=row.ZIndex+1}); local box=inst("TextBox",{BackgroundColor3=Color3.fromRGB(66,72,86),BackgroundTransparency=.12,PlaceholderText=ph,Text="",Font=Enum.Font.Gotham,TextSize=self.Env.Font,TextColor3=self.Theme.TextPrimary,ClearTextOnFocus=false,AnchorPoint=Vector2.new(1,.5),Position=UDim2.new(1,-self.Env.BodyPadX,.5,0),Size=UDim2.new(.55,0,0,self.Env.InputH),Parent=row,ZIndex=row.ZIndex+1}); inst("UICorner",{CornerRadius=UDim.new(0,8),Parent=box}); inst("UIStroke",{ApplyStrokeMode=Enum.ApplyStrokeMode.Border,Color=self.Theme.Stroke,Thickness=1,Transparency=.25,Parent=box})
+    local function commit(txt,fromLoad) value=tostring(txt or ""); self.Config:Set(flag or "",value); if flag and getgenv().Payback.Options[flag] then getgenv().Payback.Options[flag].Value=value end; if not fromLoad then if o.Callback then o.Callback(value) end for _,f in ipairs(callbacks) do f(value) end end end
+    box:GetPropertyChangedSignal("Text"):Connect(function() commit(box.Text) end); box.FocusLost:Connect(function() commit(box.Text) end)
+    if flag then self.Config:Bind(flag,function(v) commit(v,true); box.Text=tostring(v or "") end); self.Config:Set(flag,value); register(getgenv().Payback.Options,flag,{Value=value,SetValue=function(_,v) commit(v); box.Text=tostring(v or "") end,Get=function(_) return box.Text end,OnChanged=function(_,fn) table.insert(callbacks,fn); fn(value) end}) end
+    if self.Indexer then self.Indexer(text,row) end; return {Instance=row} end
+function ControlKit:Dropdown(o) o=o or {}; local text=o.Name or "Dropdown"; local list=o.List or {"A","B"}; local def=o.Default or list[1]; local multi=o.Multi==true; local flag=o.Flag; local callbacks={}; local value=multi and {} or def; local row=self:_row(self.Env.RowH); local label=inst("TextLabel",{BackgroundTransparency=1,Text="",Font=Enum.Font.GothamMedium,TextSize=self.Env.Font,TextColor3=self.Theme.TextPrimary,TextXAlignment=Enum.TextXAlignment.Left,Position=UDim2.fromOffset(self.Env.BodyPadX,0),Size=UDim2.new(1,-self.Env.BodyPadX*2,1,0),Parent=row,ZIndex=row.ZIndex+1})
+    local opened=false; local menu=inst("Frame",{BackgroundColor3=self.Theme.Panel,BackgroundTransparency=.04,Position=UDim2.new(0,self.Env.BodyPadX,1,6),Size=UDim2.new(1,-(self.Env.BodyPadX*2),0,0),Parent=row,ZIndex=row.ZIndex+3,ClipsDescendants=true}); inst("UICorner",{CornerRadius=UDim.new(0,10),Parent=menu}); inst("UIStroke",{ApplyStrokeMode=Enum.ApplyStrokeMode.Border,Color=self.Theme.Stroke,Thickness=1,Transparency=.22,Parent=menu}); inst("UIListLayout",{Parent=menu,Padding=UDim.new(0,6)})
+    local function vtext() if multi then local t={} for k,_ in pairs(value) do table.insert(t,tostring(k)) end table.sort(t); return next(t) and table.concat(t,", ") or "--" else return tostring(value or "--") end end
+    local function rebuild() for _,c in ipairs(menu:GetChildren()) do if c:IsA("TextButton") then c:Destroy() end end; for _,it in ipairs(list) do local b=inst("TextButton",{AutoButtonColor=false,BackgroundColor3=Color3.fromRGB(66,72,86),BackgroundTransparency=.15,Text=tostring(it),Font=Enum.Font.Gotham,TextSize=self.Env.Font,TextColor3=self.Theme.TextPrimary,Size=UDim2.new(1,-12,0,self.Env.DropItem),Parent=menu,ZIndex=menu.ZIndex}); inst("UICorner",{CornerRadius=UDim.new(0,8),Parent=b}); inst("UIStroke",{ApplyStrokeMode=Enum.ApplyStrokeMode.Border,Color=Color3.fromRGB(88,96,114),Thickness=1,Transparency=.35,Parent=b}); b.MouseEnter:Connect(function() spring(b) end); b.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then ripple(b,i.Position) end end); b.MouseButton1Click:Connect(function() if multi then value[it]=not value[it] or nil else value=it end; label.Text=text..": "..vtext(); self.Config:Set(flag or "", value); if o.Callback then o.Callback(value) end for _,f in ipairs(callbacks) do f(value) end; if not multi then opened=false; safeTween(menu,.18,{Size=UDim2.new(1,-(self.Env.BodyPadX*2),0,0)}) end end) end; label.Text=text..": "..vtext() end
+    local function mHeight() return math.clamp(#list*(self.Env.DropItem+6)+6,0,self.Env.DropMax) end
+    rebuild(); row.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then ripple(row,i.Position); opened=not opened; safeTween(menu,.18,{Size=opened and UDim2.new(1,-(self.Env.BodyPadX*2),0,mHeight()) or UDim2.new(1,-(self.Env.BodyPadX*2),0,0)}) end end)
+    if flag then self.Config:Bind(flag,function(v) value=multi and (v or {}) or v; rebuild() end); self.Config:Set(flag,value); register(getgenv().Payback.Options,flag,{Value=value,SetValue=function(_,v) value=multi and (v or {}) or v; self.Config:Set(flag or "",value); rebuild(); if o.Callback then o.Callback(value) end end,OnChanged=function(_,fn) table.insert(callbacks,fn); fn(value) end}) end
+    if self.Indexer then self.Indexer(text,row) end; return {Instance=row} end
+function ControlKit:ColorPicker(o)
+    o=o or {}; local text=o.Name or "Color"; local def=o.Default or Color3.fromRGB(0,186,255); local flag=o.Flag; local callbacks={}; local value=def
+    local row=self:_row(self.Env.RowH)
+    inst("TextLabel",{BackgroundTransparency=1,Text=text,Font=Enum.Font.GothamMedium,TextSize=self.Env.Font,TextColor3=self.Theme.TextPrimary,TextXAlignment=Enum.TextXAlignment.Left,Position=UDim2.fromOffset(self.Env.BodyPadX,0),Size=UDim2.new(1,-(self.Env.BodyPadX*2+52),1,0),Parent=row,ZIndex=row.ZIndex+1})
+    local swatch=inst("Frame",{BackgroundColor3=value,AnchorPoint=Vector2.new(1,.5),Position=UDim2.new(1,-self.Env.BodyPadX,.5,0),Size=UDim2.fromOffset(52,self.Env.InputH),Parent=row,ZIndex=row.ZIndex+1}); inst("UICorner",{CornerRadius=UDim.new(0,8),Parent=swatch}); inst("UIStroke",{ApplyStrokeMode=Enum.ApplyStrokeMode.Border,Color=darker(value),Thickness=1,Transparency=.15,Parent=swatch})
+    local modal,overlay; local H,S,V=Color3.toHSV(value)
+    local function setSwatch(c) value=c; swatch.BackgroundColor3=c; local st=swatch:FindFirstChildOfClass("UIStroke"); if st then st.Color=darker(c) end end
+    local function open()
+        overlay=inst("TextButton",{AutoButtonColor=false,Text="",BackgroundTransparency=.4,BackgroundColor3=Color3.new(0,0,0),Size=UDim2.fromScale(1,1),Position=UDim2.fromOffset(0,0),ZIndex=999,Parent=self.Screen})
+        modal=inst("Frame",{BackgroundColor3=self.Theme.Panel,BackgroundTransparency=.04,Size=UDim2.fromOffset(260,240),ZIndex=1000,Parent=self.Screen}); inst("UICorner",{CornerRadius=UDim.new(0,10),Parent=modal}); inst("UIStroke",{ApplyStrokeMode=Enum.ApplyStrokeMode.Border,Color=self.Theme.Stroke,Thickness=1,Transparency=.22,Parent=modal})
+        inst("TextLabel",{BackgroundTransparency=1,Text="Color",Font=Enum.Font.GothamBold,TextSize=14,TextColor3=self.Theme.TextPrimary,TextXAlignment=Enum.TextXAlignment.Left,Position=UDim2.fromOffset(10,8),Size=UDim2.fromOffset(160,18),Parent=modal,ZIndex=1001})
+        local sv=inst("Frame",{Position=UDim2.fromOffset(10,32),Size=UDim2.fromOffset(170,170),BackgroundColor3=Color3.fromHSV(H,1,1),Parent=modal,ZIndex=1001}); inst("UICorner",{CornerRadius=UDim.new(0,6),Parent=sv}); inst("UIStroke",{ApplyStrokeMode=Enum.ApplyStrokeMode.Border,Color=self.Theme.Stroke,Thickness=1,Transparency=.25,Parent=sv})
+        inst("ImageLabel",{Image="rbxassetid://4155801252",BackgroundTransparency=1,Size=UDim2.fromScale(1,1),Parent=sv,ZIndex=1002})
+        local hue=inst("Frame",{Position=UDim2.fromOffset(190,32),Size=UDim2.fromOffset(16,170),BackgroundColor3=Color3.new(1,1,1),Parent=modal,ZIndex=1001}); inst("UICorner",{CornerRadius=UDim.new(0,6),Parent=hue}); inst("UIStroke",{ApplyStrokeMode=Enum.ApplyStrokeMode.Border,Color=self.Theme.Stroke,Thickness=1,Transparency=.25,Parent=hue})
+        local seq={}; for t=0,1,0.1 do table.insert(seq,ColorSequenceKeypoint.new(t,Color3.fromHSV(t,1,1))) end; inst("UIGradient",{Color=ColorSequence.new(seq),Rotation=90,Parent=hue})
+        local hex=inst("TextBox",{BackgroundColor3=self.Theme.Panel2,Text="#"..Color3.fromHSV(H,S,V):ToHex(),Font=Enum.Font.Gotham,TextSize=13,TextColor3=self.Theme.TextPrimary,ClearTextOnFocus=false,Position=UDim2.fromOffset(10,208),Size=UDim2.fromOffset(120,22),Parent=modal,ZIndex=1002})
+        local rgb=inst("TextBox",{BackgroundColor3=self.Theme.Panel2,Text=("{%d, %d, %d}"):format(math.floor((Color3.fromHSV(H,S,V).R)*255),math.floor((Color3.fromHSV(H,S,V).G)*255),math.floor((Color3.fromHSV(H,S,V).B)*255)),Font=Enum.Font.Gotham,TextSize=13,TextColor3=self.Theme.TextPrimary,ClearTextOnFocus=false,Position=UDim2.fromOffset(136,208),Size=UDim2.fromOffset(112,22),Parent=modal,ZIndex=1002})
+        local apply=inst("TextButton",{AutoButtonColor=false,Text="Apply",Font=Enum.Font.GothamBold,TextSize=13,TextColor3=self.Theme.TextPrimary,BackgroundColor3=self.Theme.Accent,Size=UDim2.fromOffset(72,22),Position=UDim2.fromOffset(190,8),Parent=modal,ZIndex=1002}); inst("UICorner",{CornerRadius=UDim.new(0,6),Parent=apply})
+        local cancel=inst("TextButton",{AutoButtonColor=false,Text="Cancel",Font=Enum.Font.Gotham,TextSize=13,TextColor3=self.Theme.TextMuted,BackgroundColor3=self.Theme.Panel2,Size=UDim2.fromOffset(72,22),Position=UDim2.fromOffset(112,8),Parent=modal,ZIndex=1002}); inst("UICorner",{CornerRadius=UDim.new(0,6),Parent=cancel}); inst("UIStroke",{ApplyStrokeMode=Enum.ApplyStrokeMode.Border,Color=self.Theme.Stroke,Thickness=1,Transparency=.25,Parent=cancel})
+        local function place() local ax=row.AbsolutePosition.X + math.max(0,row.AbsoluteSize.X-260); local ay=row.AbsolutePosition.Y + row.AbsoluteSize.Y + 8; modal.Position=UDim2.fromOffset(ax,ay) end; place(); local rs; rs=RunService.RenderStepped:Connect(function() if alive(modal) then place() else if rs then rs:Disconnect() end end end)
+        local dragSV=false; sv.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then dragSV=true end end)
+        sv.InputEnded:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then dragSV=false end end)
+        UserInputService.InputChanged:Connect(function(i) if dragSV and (i.UserInputType==Enum.UserInputType.MouseMovement or i.UserInputType==Enum.UserInputType.Touch) then local minx,maxx=sv.AbsolutePosition.X,sv.AbsolutePosition.X+sv.AbsoluteSize.X; local miny,maxy=sv.AbsolutePosition.Y,sv.AbsolutePosition.Y+sv.AbsoluteSize.Y; local x=math.clamp(i.Position.X,minx,maxx); local y=math.clamp(i.Position.Y,miny,maxy); S=(x-minx)/(maxx-minx); V=1-((y-miny)/(maxy-miny)); sv.BackgroundColor3=Color3.fromHSV(H,1,1); hex.Text="#"..Color3.fromHSV(H,S,V):ToHex(); rgb.Text=("{%d, %d, %d}"):format(math.floor(Color3.fromHSV(H,S,V).R*255),math.floor(Color3.fromHSV(H,S,V).G*255),math.floor(Color3.fromHSV(H,S,V).B*255)) end end)
+        local dragH=false; hue.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then dragH=true end end)
+        hue.InputEnded:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then dragH=false end end)
+        UserInputService.InputChanged:Connect(function(i) if dragH and (i.UserInputType==Enum.UserInputType.MouseMovement or i.UserInputType==Enum.UserInputType.Touch) then local miny,maxy=hue.AbsolutePosition.Y,hue.AbsolutePosition.Y+hue.AbsoluteSize.Y; local y=math.clamp(i.Position.Y,miny,maxy); H=(y-miny)/(maxy-miny); sv.BackgroundColor3=Color3.fromHSV(H,1,1); hex.Text="#"..Color3.fromHSV(H,S,V):ToHex(); rgb.Text=("{%d, %d, %d}"):format(math.floor(Color3.fromHSV(H,S,V).R*255),math.floor(Color3.fromHSV(H,S,V).G*255),math.floor(Color3.fromHSV(H,S,V).B*255)) end end)
+        hex.FocusLost:Connect(function(enter) if enter then local ok,c=pcall(Color3.fromHex,hex.Text:gsub("#","")); if ok then H,S,V=Color3.toHSV(c); sv.BackgroundColor3=Color3.fromHSV(H,1,1) else hex.Text="#"..Color3.fromHSV(H,S,V):ToHex() end end end)
+        rgb.FocusLost:Connect(function(enter) if enter then local r,g,b=rgb.Text:match("{%s*(%d+)%s*,%s*(%d+)%s*,%s*(%d+)%s*}"); if r and g and b then local c=Color3.fromRGB(tonumber(r),tonumber(g),tonumber(b)); H,S,V=Color3.toHSV(c); sv.BackgroundColor3=Color3.fromHSV(H,1,1) else rgb.Text=("{%d, %d, %d}"):format(math.floor(Color3.fromHSV(H,S,V).R*255),math.floor(Color3.fromHSV(H,S,V).G*255),math.floor(Color3.fromHSV(H,S,V).B*255)) end end end)
+        apply.MouseButton1Click:Connect(function() local c=Color3.fromHSV(H,S,V); setSwatch(c); self.Config:Set(flag or "",c); if o.Callback then o.Callback(c) end; if overlay then overlay:Destroy() end; if modal then modal:Destroy() end end)
+        cancel.MouseButton1Click:Connect(function() if overlay then overlay:Destroy() end if modal then modal:Destroy() end end)
+    end
+    swatch.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then ripple(swatch,i.Position); open() end end)
+    if flag then self.Config:Bind(flag,function(v) if typeof(v)=="Color3" then setSwatch(v) end end); self.Config:Set(flag,value); register(getgenv().Payback.Options,flag,{Value=value,SetValue=function(_,v) if typeof(v)=="Color3" then setSwatch(v) end end}) end
+    if self.Indexer then self.Indexer(text,row) end; return {Instance=row} end
+
+-- Tabs & sections
+local Tab={}; Tab.__index=Tab
+function Tab:_build(theme, env, indexer)
+    local w=math.max(80, textW(self.Name, env.TabFont, Enum.Font.GothamBold)+18)
+    self.Button=inst("TextButton",{AutoButtonColor=false,BackgroundTransparency=1,Text=self.Name,Font=Enum.Font.GothamBold,TextSize=env.TabFont,TextColor3=theme.TextMuted,Size=UDim2.fromOffset(w,env.TabHeight),Parent=self.TabBar,ZIndex=self.TabBar.ZIndex+2})
+    self.Under=inst("Frame",{BackgroundColor3=theme.Accent,BorderSizePixel=0,Size=UDim2.new(1,0,0,2),Position=UDim2.new(0,0,1,0),Parent=self.Button,ZIndex=self.Button.ZIndex+1}); self.Under.Visible=false
+
+    -- Page with pattern overfill to avoid seams
+    self.Page=inst("ScrollingFrame",{BackgroundColor3=theme.Panel,BackgroundTransparency=.04,BorderSizePixel=0,ScrollBarThickness=env.Scrollbar,ScrollingDirection=Enum.ScrollingDirection.Y,CanvasSize=UDim2.fromOffset(0,0),AutomaticCanvasSize=Enum.AutomaticSize.Y,Size=UDim2.new(1,0,1,0),Parent=self.Pages,ZIndex=self.Pages.ZIndex+1,ClipsDescendants=true})
+    inst("UICorner",{CornerRadius=UDim.new(0,12),Parent=self.Page})
+    inst("UIStroke",{ApplyStrokeMode=Enum.ApplyStrokeMode.Border,Color=theme.Stroke,Thickness=1,Transparency=.25,Parent=self.Page})
+    local design = inst("Frame",{BackgroundTransparency=1,Position=UDim2.fromOffset(-2,-2),Size=UDim2.new(1,4,1,4),Parent=self.Page,ZIndex=self.Page.ZIndex})
+    inst("ImageLabel",{BackgroundTransparency=1,Image="rbxassetid://5553946656",ScaleType=Enum.ScaleType.Tile,TileSize=UDim2.fromOffset(96,96),ImageTransparency=.93,Size=UDim2.fromScale(1,1),Parent=design,ZIndex=design.ZIndex})
+
+    -- Safe area inside page
+    local safe = inst("Frame",{BackgroundTransparency=1,Size=UDim2.new(1,0,1,0),Parent=self.Page,ZIndex=self.Page.ZIndex+1,AutomaticSize=Enum.AutomaticSize.Y})
+    inst("UIPadding",{Parent=safe,PaddingTop=UDim.new(0,24),PaddingLeft=UDim.new(0,24),PaddingRight=UDim.new(0,24),PaddingBottom=UDim.new(0,18)})
+
+    -- Two columns with half‑gutter
+    local columns=inst("Frame",{BackgroundTransparency=1,Parent=safe,Size=UDim2.new(1,0,0,0),ZIndex=safe.ZIndex+1,AutomaticSize=Enum.AutomaticSize.Y})
+    local gutter=24; local half=math.floor(gutter/2)
+    local left =inst("Frame",{BackgroundTransparency=1,Size=UDim2.new(.5,-half,0,0),Position=UDim2.fromOffset(0,0),Parent=columns,ZIndex=columns.ZIndex,AutomaticSize=Enum.AutomaticSize.Y})
+    local right=inst("Frame",{BackgroundTransparency=1,Size=UDim2.new(.5,-half,0,0),Position=UDim2.new(.5,half,0,0),Parent=columns,ZIndex=columns.ZIndex,AutomaticSize=Enum.AutomaticSize.Y})
+    inst("UIListLayout",{Parent=left,Padding=UDim.new(0,12)})
+    inst("UIListLayout",{Parent=right,Padding=UDim.new(0,12)})
+
+    self.Left,self.Right,self.Columns=left,right,columns
+    self.ControlKitLeft =ControlKit.new(left,theme,self.Config,env,getgenv().Payback,self.Screen,indexer)
+    self.ControlKitRight=ControlKit.new(right,theme,self.Config,env,getgenv().Payback,self.Screen,indexer)
+
+    self.Button.MouseEnter:Connect(function() spring(self.Button) end)
+    self.Button.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then ripple(self.Button,i.Position) end end)
+    self.Button.MouseButton1Click:Connect(function() if self.Select then self.Select() end end)
+end
+function Tab:AddSection(name, side)
+    local container=(side=="right") and self.Right or self.Left
+    local section=inst("Frame",{BackgroundColor3=self.Theme.Panel2,BackgroundTransparency=.06,Size=UDim2.new(1,0,0,28),Parent=container,ZIndex=container.ZIndex+1})
+    inst("UICorner",{CornerRadius=UDim.new(0,10),Parent=section})
+    inst("UIStroke",{ApplyStrokeMode=Enum.ApplyStrokeMode.Border,Color=self.Theme.Stroke,Thickness=1,Transparency=.22,Parent=section})
+    inst("TextLabel",{BackgroundTransparency=1,Font=Enum.Font.GothamBold,Text=name or "Section",TextSize=self.ControlKitLeft.Env.Font,TextColor3=self.Theme.TextMuted,TextXAlignment=Enum.TextXAlignment.Left,Position=UDim2.fromOffset(12,2),Size=UDim2.new(1,-24,0,24),Parent=section,ZIndex=section.ZIndex+1})
+    local body=inst("Frame",{BackgroundTransparency=1,Position=UDim2.fromOffset(0,28),Size=UDim2.new(1,0,0,0),Parent=section,ZIndex=section.ZIndex+1,AutomaticSize=Enum.AutomaticSize.Y})
+    inst("UIPadding",{Parent=body,PaddingTop=UDim.new(0,14),PaddingLeft=UDim.new(0,14),PaddingRight=UDim.new(0,14),PaddingBottom=UDim.new(0,14)})
+    inst("UIListLayout",{Parent=body,Padding=UDim.new(0,10)})
+    section.AutomaticSize=Enum.AutomaticSize.Y
+    return ControlKit.new(body,self.Theme,self.Config,self.ControlKitLeft.Env,getgenv().Payback,self.Screen,function(n,frame) self._index=self._index or {}; table.insert(self._index,{string.lower(tostring(n or "")),frame}) end)
+end
+function Tab:Controls(side) return (side=="right") and self.ControlKitRight or self.ControlKitLeft end
+
+-- Window / library
+local PaybackLib={}; PaybackLib.__index=PaybackLib
+local Window ={};  Window.__index=Window
+
+function PaybackLib:CreateWindow(opts)
+    opts = opts or {}
+    local cam=Workspace.CurrentCamera or Workspace:WaitForChild("Camera")
+    local vw,vh=(cam and cam.ViewportSize.X or 1280),(cam and cam.ViewportSize.Y or 720)
+
+    local theme=opts.Theme or defaultTheme(); if opts.Accent then theme.Accent=opts.Accent end
+    local env={
+        IsMobile=UserInputService.TouchEnabled, Font=UserInputService.TouchEnabled and 16 or 14,
+        RowH=UserInputService.TouchEnabled and 46 or 38, TogW=UserInputService.TouchEnabled and 50 or 34,
+        TogH=UserInputService.TouchEnabled and 26 or 20, Knob=UserInputService.TouchEnabled and 18 or 12,
+        KnobInset=UserInputService.TouchEnabled and 14 or 10, SliderH=UserInputService.TouchEnabled and 12 or 10,
+        InputH=UserInputService.TouchEnabled and 32 or 26, Scrollbar=UserInputService.TouchEnabled and 6 or 4,
+        DropItem=UserInputService.TouchEnabled and 32 or 28, DropMax=UserInputService.TouchEnabled and 220 or 180,
+        TabHeight=UserInputService.TouchEnabled and 42 or 36, TabFont=UserInputService.TouchEnabled and 16 or 14,
+        BodyPadX=18, RowExtra=8
+    }
+
+    local screen=inst("ScreenGui",{Name="PaybackUI",ResetOnSpawn=false,ZIndexBehavior=Enum.ZIndexBehavior.Global,Parent=GuiParent(),DisplayOrder=999999})
+    screen.IgnoreGuiInset=true
+
+    -- dim + blur
+    local dim=inst("Frame",{BackgroundColor3=Color3.new(0,0,0),BackgroundTransparency=1,Position=UDim2.fromOffset(-2,-2),Size=UDim2.new(1,4,1,4),Parent=screen,ZIndex=5})
+    local blurObj=inst("BlurEffect",{Name="PaybackBlur",Size=0,Parent=Lighting})
+    local w = env.IsMobile and math.min(math.floor(vw*0.96), 900) or 900
+    local h = env.IsMobile and math.min(math.floor(vh*0.86), 660) or 620
+
+    local main=inst("Frame",{Name="Main",BackgroundColor3=theme.Background,BackgroundTransparency=.06,Size=UDim2.fromOffset(w,h),Parent=screen,ZIndex=10})
+    main.AnchorPoint=Vector2.new(.5,.5); main.Position=UDim2.fromScale(.5,.5)
+    inst("UICorner",{CornerRadius=UDim.new(0,14),Parent=main})
+    inst("UIStroke",{ApplyStrokeMode=Enum.ApplyStrokeMode.Border,Color=theme.Stroke,Thickness=1,Transparency=.22,Parent=main})
+
+    -- shell fills 1:1
+    local shell = inst("Frame",{BackgroundTransparency=1,Size=UDim2.fromScale(1,1),Position=UDim2.fromOffset(0,0),Parent=main,ZIndex=11})
+
+    local top=inst("Frame",{Name="Topbar",BackgroundColor3=theme.Panel,BackgroundTransparency=.04,Size=UDim2.new(1,0,0,52),Parent=shell,ZIndex=15})
+    inst("UICorner",{CornerRadius=UDim.new(0,12),Parent=top})
+    inst("UIStroke",{ApplyStrokeMode=Enum.ApplyStrokeMode.Border,Color=theme.Stroke,Thickness=1,Transparency=.22,Parent=top})
+    inst("Frame",{BackgroundColor3=theme.Accent,BorderSizePixel=0,AnchorPoint=Vector2.new(.5,1),Position=UDim2.new(.5,0,1,0),Size=UDim2.new(1,-8,0,2),Parent=top,ZIndex=16})
+
+    local title=inst("TextLabel",{BackgroundTransparency=1,Font=Enum.Font.GothamBlack,Text=opts.Title or "Payback",TextSize=env.IsMobile and 20 or 18,TextColor3=theme.TextPrimary,TextXAlignment=Enum.TextXAlignment.Left,Position=UDim2.fromOffset(14,0),Size=UDim2.new(1,-340,1,0),Parent=top,ZIndex=16})
+    local tgrad=inst("UIGradient",{Parent=title,Rotation=0})
+    tgrad.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0.00, Color3.fromRGB( 72,132,255)),
+        ColorSequenceKeypoint.new(0.18, Color3.fromRGB(115, 84,255)),
+        ColorSequenceKeypoint.new(0.36, Color3.fromRGB(172, 66,255)),
+        ColorSequenceKeypoint.new(0.54, Color3.fromRGB(255, 66,171)),
+        ColorSequenceKeypoint.new(0.72, Color3.fromRGB(255,110, 96)),
+        ColorSequenceKeypoint.new(0.90, Color3.fromRGB(255,170, 66)),
+        ColorSequenceKeypoint.new(1.00, Color3.fromRGB(255,210,120)),
+    })
+    tgrad.Offset = Vector2.new(-1,0)
+    task.spawn(function()
+        while alive(title) do
+            local a=safeTween(tgrad,6,{Offset=Vector2.new(1,0)},Enum.EasingStyle.Linear,Enum.EasingDirection.In); if a then a.Completed:Wait() else task.wait(6) end
+            local b=safeTween(tgrad,6,{Offset=Vector2.new(-1,0)},Enum.EasingStyle.Linear,Enum.EasingDirection.In); if b then b.Completed:Wait() else task.wait(6) end
+        end
+    end)
+
+    local searchO=inst("Frame",{BackgroundColor3=theme.Panel2,BackgroundTransparency=.10,AnchorPoint=Vector2.new(1,.5),Position=UDim2.new(1,-86,.5,0),Size=UDim2.fromOffset(240,32),Parent=top,ZIndex=16})
+    inst("UICorner",{CornerRadius=UDim.new(0,8),Parent=searchO})
+    inst("UIStroke",{ApplyStrokeMode=Enum.ApplyStrokeMode.Border,Color=theme.Stroke,Thickness=1,Transparency=.24,Parent=searchO})
+    local search=inst("TextBox",{BackgroundTransparency=1,PlaceholderText="Search features...",Text="",Font=Enum.Font.Gotham,TextSize=14,TextColor3=theme.TextPrimary,PlaceholderColor3=theme.TextMuted,Position=UDim2.fromOffset(8,0),Size=UDim2.new(1,-8,1,0),Parent=searchO,ZIndex=17,ClearTextOnFocus=false})
+    local btnClose=inst("TextButton",{AutoButtonColor=false,BackgroundTransparency=1,Text="×",Font=Enum.Font.GothamBlack,TextSize=22,TextColor3=theme.TextMuted,AnchorPoint=Vector2.new(1,.5),Position=UDim2.new(1,-6,.5,0),Size=UDim2.fromOffset(24,24),Parent=top,ZIndex=16})
+    local btnMin  =inst("TextButton",{AutoButtonColor=false,BackgroundTransparency=1,Text="–",Font=Enum.Font.GothamBlack,TextSize=24,TextColor3=theme.TextMuted,AnchorPoint=Vector2.new(1,.5),Position=UDim2.new(1,-36,.5,0),Size=UDim2.fromOffset(24,24),Parent=top,ZIndex=16})
+
+    -- Body
+    local body=inst("Frame",{BackgroundTransparency=1,Position=UDim2.fromOffset(0,60),Size=UDim2.new(1,0,1,-(60+28)),Parent=shell,ZIndex=12,ClipsDescendants=true})
+
+    -- >>> GLASS STRIP behind tabs (the blurred look you liked)
+    local tabStripHeight = env.TabHeight + 8
+    local tabGlass = inst("Frame",{BackgroundColor3=theme.Panel,BackgroundTransparency=.18,Size=UDim2.new(1,0,0,tabStripHeight),Parent=body,ZIndex=12,BorderSizePixel=0})
+    inst("UICorner",{CornerRadius=UDim.new(0,12),Parent=tabGlass})
+    inst("UIStroke",{ApplyStrokeMode=Enum.ApplyStrokeMode.Border,Color=theme.Stroke,Thickness=1,Transparency=.22,Parent=tabGlass})
+    inst("ImageLabel",{BackgroundTransparency=1,Image="rbxassetid://5553946656",ScaleType=Enum.ScaleType.Tile,TileSize=UDim2.fromOffset(88,88),ImageTransparency=.94,Size=UDim2.fromScale(1,1),Parent=tabGlass,ZIndex=tabGlass.ZIndex})
+
+    -- Tabs
+    local tabbar=inst("Frame",{BackgroundTransparency=1,Size=UDim2.new(1,0,0,env.TabHeight),Parent=body,ZIndex=13}); inst("UIListLayout",{Parent=tabbar,FillDirection=Enum.FillDirection.Horizontal,Padding=UDim.new(0,8)})
+    local pages=inst("Frame",{Name="Pages",BackgroundTransparency=1,Position=UDim2.fromOffset(0,tabStripHeight),Size=UDim2.new(1,0,1,-tabStripHeight),Parent=body,ZIndex=12,ClipsDescendants=true})
+    local pageLayout=inst("UIPageLayout",{Parent=pages,EasingStyle=Enum.EasingStyle.Quad,EasingDirection=Enum.EasingDirection.Out,Padding=UDim.new(0,8),Animated=true,Circular=false,TweenTime=.25})
+
+    local status=inst("Frame",{BackgroundColor3=theme.Panel,BackgroundTransparency=.04,AnchorPoint=Vector2.new(.5,1),Position=UDim2.new(.5,0,1,0),Size=UDim2.new(1,0,0,26),Parent=shell,ZIndex=14})
+    inst("UICorner",{CornerRadius=UDim.new(0,8),Parent=status})
+    inst("UIStroke",{ApplyStrokeMode=Enum.ApplyStrokeMode.Border,Color=theme.Stroke,Thickness=1,Transparency=.24,Parent=status})
+    local statusText=inst("TextLabel",{BackgroundTransparency=1,Text="Payback ready.",Font=Enum.Font.Gotham,TextSize=12,TextColor3=theme.TextMuted,TextXAlignment=Enum.TextXAlignment.Left,Position=UDim2.fromOffset(8,0),Size=UDim2.new(1,-16,1,0),Parent=status,ZIndex=15})
+
+    -- appear
+    local scale=inst("UIScale",{Parent=main,Scale=.92}); main.Visible=false
+    task.delay(.05,function() if alive(main) then main.Visible=true; safeTween(scale,.22,{Scale=1},Enum.EasingStyle.Quint); safeTween(main,.18,{BackgroundTransparency=.06}); safeTween(dim,.2,{BackgroundTransparency=.48}); safeTween(blurObj,.2,{Size=(env.IsMobile and 12 or 16)}) end end)
+
+    -- drag desktop
+    if not env.IsMobile then
+        local function makeDraggable(frame, handle, cutoffY)
+            handle=handle or frame; cutoffY=cutoffY or 999; handle.Active=true
+            handle.InputBegan:Connect(function(input)
+                if input.UserInputType==Enum.UserInputType.MouseButton1 then
+                    local rel=input.Position.Y - handle.AbsolutePosition.Y
+                    if rel <= cutoffY then
+                        local startPos=frame.Position; local start=UserInputService:GetMouseLocation()
+                        while UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) do
+                            local d=UserInputService:GetMouseLocation()-start
+                            frame.Position=UDim2.new(startPos.X.Scale,startPos.X.Offset+d.X,startPos.Y.Scale,startPos.Y.Offset+d.Y)
+                            RunService.RenderStepped:Wait()
+                        end
+                    end
+                end
+            end)
+        end
+        makeDraggable(main, top, 52)
+    end
+
+    local cfg=Config.new(opts.ConfigDir or "Payback-UI")
+    local notify=createNotifier(screen,theme)
+    local watermark=createWatermark(screen,theme)
+
+    -- search filter
+    local winRef=nil
+    local function applySearchFilter()
+        local w=winRef; if not w then return end
+        local q=string.lower(search.Text or "")
+        local current=pageLayout.CurrentPage; if not current then return end
+        local active=w._activeTab; if not active then for _,t in ipairs(w.Tabs or {}) do if t.Page==current then active=t break end end end
+        if not active or not active._index then return end
+        for _,pair in ipairs(active._index) do pair[2].Visible = (q=="" or string.find(pair[1],q,1,true)~=nil) end
+    end
+    search:GetPropertyChangedSignal("Text"):Connect(applySearchFilter)
+
+    local window=setmetatable({
+        Screen=screen,Dim=dim,Main=main,Top=top,Status=statusText,
+        TabBar=tabbar,Pages=pages,PageLayout=pageLayout,Tabs={},
+        Theme=theme,Config=cfg,Notifier=notify,Watermark=watermark,Env=env,
+        _visible=true,_alive=true,_blur=blurObj,_activeTab=nil
+    },Window); winRef=window
+
+    local keybind=opts.Keybind or Enum.KeyCode.Insert; if typeof(keybind)=="string" then keybind=Enum.KeyCode[keybind] or Enum.KeyCode.Insert end
+    UserInputService.InputBegan:Connect(function(i,gpe) if gpe then return end; if i.KeyCode==keybind and window._alive then window:Toggle() end end)
+    btnClose.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then ripple(btnClose,i.Position) end end)
+    btnMin.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then ripple(btnMin,i.Position) end end)
+    btnClose.MouseButton1Click:Connect(function() window:Toggle(false) end) -- hide only
+    btnMin.MouseButton1Click:Connect(function() window:Toggle(false) end)
+
+    function window:SetDimAlpha(a) safeTween(self.Dim,.15,{BackgroundTransparency=1-math.clamp(a,0,1)}) end
+    function window:SetBlurPower(p) if self._blur then safeTween(self._blur,.15,{Size=math.max(0,p)}) end end
+    function window:SetFPSVisible(b) self.Watermark:Show(b and true or false) end
+    function window:Notify(o) self.Notifier(o) end
+
+    function window:AddTab(name)
+        local tab=setmetatable({Name=name or "Tab",TabBar=self.TabBar,Pages=self.Pages,Theme=self.Theme,Config=self.Config,Screen=self.Screen},Tab)
+        tab._index = {}
+        tab:_build(self.Theme,self.Env,function(label,frame) tab._index[#tab._index+1]={string.lower(tostring(label or "")),frame} end)
+        table.insert(self.Tabs,tab)
+        tab.Select=function()
+            for _,t in ipairs(self.Tabs) do t.Button.TextColor3=self.Theme.TextMuted; t.Under.Visible=false end
+            tab.Button.TextColor3=self.Theme.TextPrimary; tab.Under.Visible=true
+            self.PageLayout:JumpTo(tab.Page); self._activeTab=tab; applySearchFilter()
+        end
+        tab.Button.MouseButton1Click:Connect(function() self.Status.Text=(name or "Tab").." selected." end)
+        if #self.Tabs==1 then tab.Select() end
+        return {
+            Controls=function(_,side) return tab:Controls(side) end,
+            Section=function(_,label,side) return tab:AddSection(label,side) end,
+            Raw=tab
+        }
+    end
+
+    function window:Toggle(force)
+        if not self._alive or not alive(self.Main) then return end
+        if force~=nil then self._visible=force else self._visible=not self._visible end
+        local scale=self.Main:FindFirstChildOfClass("UIScale")
+        if self._visible then
+            self.Main.Visible=true; safeTween(scale,.18,{Scale=1}); safeTween(self.Main,.14,{BackgroundTransparency=.06}); safeTween(self.Dim,.14,{BackgroundTransparency=.48}); safeTween(self._blur,.2,{Size=(self.Env.IsMobile and 12 or 16)})
+        else
+            safeTween(scale,.16,{Scale=.92}); safeTween(self.Main,.16,{BackgroundTransparency=1}); safeTween(self.Dim,.16,{BackgroundTransparency=1}); safeTween(self._blur,.2,{Size=0}); task.delay(.17,function() if alive(self.Main) then self.Main.Visible=false end end)
+        end
+    end
+    function window:Unload()
+        self._alive=false; getgenv().Payback.Unloaded=true
+        safeTween(self.Main,.12,{BackgroundTransparency=1}); safeTween(self.Dim,.12,{BackgroundTransparency=1}); if self._blur then safeTween(self._blur,.18,{Size=0}) end
+        task.delay(.13,function() if self.Screen then self.Screen:Destroy() end if self._blur then self._blur:Destroy() end end)
+    end
+    Workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+        if alive(main) then local vs=Workspace.CurrentCamera.ViewportSize; main.Size=UDim2.fromOffset(math.min(w,vs.X-40), math.min(h,vs.Y-40)); main.Position=UDim2.fromScale(.5,.5) end
+    end)
+
+    -- === Save manager embedded (always used by library)
+    local SaveManager={}
+    local function sanitize(name) name=tostring(name or ""):gsub("^%s+",""):gsub("%s+$",""):gsub("[^%w_%-%s]","_"):gsub("%s+","_"):sub(1,32); if name=="" then name="default" end; return name end
+    function SaveManager:SetFolder(p) self.Folder=p or "Payback-UI"; return self end
+    function SaveManager:Collect() local out={}; for k,v in pairs(getgenv().Payback.Toggles) do out[k]=v.Value end; for k,v in pairs(getgenv().Payback.Options) do out[k]=v.Value end; for k,v in pairs(window.Config.Values) do if out[k]==nil then out[k]=v end end; return out end
+    function SaveManager:Apply(t) if type(t)~="table" then return end for k,v in pairs(t) do if getgenv().Payback.Toggles[k] then getgenv().Payback.Toggles[k]:SetValue(v) elseif getgenv().Payback.Options[k] then getgenv().Payback.Options[k]:SetValue(v) else window.Config:Set(k,v) end end end
+    function SaveManager:Save(name) window.Config.Directory=self.Folder or window.Config.Directory; for k,v in pairs(self:Collect()) do window.Config:Set(k,v) end; return window.Config:Save(sanitize(name)) end
+    function SaveManager:Load(name) local ok=window.Config:Load(sanitize(name)); if ok then self:Apply(window.Config.Values) end; return ok end
+    function SaveManager:List() local path=(self.Folder or window.Config.Directory); local list={}; if isfolder and isfile then if not isfolder(path) then return list end; local ok,files=pcall(function() return listfiles(path) end); if ok and type(files)=="table" then for _,fp in ipairs(files) do if type(fp)=="string" and fp:sub(-5)==".json" then list[#list+1]=(fp:match("[^/\\]+$") or fp):gsub("%.json$","") end end end end; table.sort(list); return list end
+    function SaveManager:BuildConfigTab(tabObj)
+        local left=tabObj:Section("Configuration","left"); local right=tabObj:Section("Manage","right")
+        left:Textbox({Name="Config Name",Placeholder="e.g. legit1",Flag="cfg_name"})
+        local function currentName() local opt=getgenv().Payback.Options["cfg_name"]; local n=opt and tostring(opt.Value or "") or ""; return sanitize(n) end
+        left:Button({Name="Save",Callback=function() local name=currentName(); local ok,err=self:Save(name); window:Notify({Title="Config",Content=ok and ("Saved '"..name.."'") or ("Save failed: "..tostring(err)),Duration=3}); self:_refresh() end})
+        left:Button({Name="Load Selected",Callback=function() local sel=self._selected; if sel then local ok=self:Load(sel); window:Notify({Title="Config",Content=ok and ("Loaded '"..sel.."'") or "Load failed",Duration=3}) else window:Notify({Title="Config",Content="No config selected.",Duration=3}) end; self:_refresh() end})
+        left:Toggle({Name="Autoload selected on start",Flag="cfg_autoload",Default=false})
+        left:Button({Name="Set Autoload",Callback=function() if not writefile then window:Notify({Title="Config",Content="Filesystem unavailable",Duration=3}); return end; local folder=self.Folder or window.Config.Directory; if makefolder and not isfolder(folder) then makefolder(folder) end; local name=self._selected or currentName(); writefile(folder.."/autoload.txt",name); window:Notify({Title="Config",Content="Autoload = "..name,Duration=3}) end})
+        left:Button({Name="Delete Selected",Callback=function()
+            local sel=self._selected; if not sel then window:Notify({Title="Config",Content="Nothing selected to delete.",Duration=2}); return end
+            if not (isfile and delfile) then window:Notify({Title="Config",Content="Filesystem unavailable",Duration=3}); return end
+            local path=(self.Folder or window.Config.Directory).."/"..sel..".json"; if isfile(path) then delfile(path); window:Notify({Title="Config",Content="Deleted '"..sel.."'.",Duration=2}); self._selected=nil; self:_refresh() else window:Notify({Title="Config",Content="File not found.",Duration=2}) end
+        end})
+        local holder=right.Holder; local list=inst("ScrollingFrame",{BackgroundTransparency=1,CanvasSize=UDim2.fromOffset(0,0),AutomaticCanvasSize=Enum.AutomaticSize.Y,ScrollBarThickness=6,Parent=holder,ZIndex=holder.ZIndex+1,Size=UDim2.new(1,0,0,300)})
+        inst("UIGridLayout",{Parent=list,CellPadding=UDim2.fromOffset(12,12),CellSize=UDim2.fromOffset(180,64),FillDirectionMaxCells=2,SortOrder=Enum.SortOrder.LayoutOrder})
+        function self:_refresh() for _,c in ipairs(list:GetChildren()) do if c:IsA("Frame") then c:Destroy() end end; for _,name in ipairs(self:List()) do local card=inst("Frame",{BackgroundColor3=window.Theme.Panel2,BackgroundTransparency=.06,Size=UDim2.fromOffset(180,64),Parent=list,ZIndex=list.ZIndex+1}); inst("UICorner",{CornerRadius=UDim.new(0,10),Parent=card}); inst("UIStroke",{ApplyStrokeMode=Enum.ApplyStrokeMode.Border,Color=window.Theme.Stroke,Thickness=1,Transparency=.22,Parent=card}); local selBar=inst("Frame",{BackgroundColor3=window.Theme.Accent,BackgroundTransparency=.8,Size=UDim2.new(0,4,1,0),Parent=card,ZIndex=card.ZIndex+1}); inst("TextLabel",{BackgroundTransparency=1,Text=name,Font=Enum.Font.GothamBold,TextSize=14,TextColor3=window.Theme.TextPrimary,TextXAlignment=Enum.TextXAlignment.Left,Position=UDim2.fromOffset(10,6),Size=UDim2.new(1,-20,0,18),Parent=card,ZIndex=card.ZIndex+1}); local ts=inst("TextLabel",{BackgroundTransparency=1,Text="Select",Font=Enum.Font.Gotham,TextSize=12,TextColor3=window.Theme.TextMuted,TextXAlignment=Enum.TextXAlignment.Left,Position=UDim2.fromOffset(10,28),Size=UDim2.new(1,-20,0,18),Parent=card,ZIndex=card.ZIndex+1}); card.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then ripple(card,i.Position); self._selected=name; for _,c2 in ipairs(list:GetChildren()) do if c2:IsA("Frame") then local b=c2:FindFirstChildOfClass("Frame"); if b then b.BackgroundTransparency=.8 end end end; selBar.BackgroundTransparency=.3; ts.Text="Selected" end end) end end
+        self:_refresh()
+    end
+    function SaveManager:LoadAutoload() if not (readfile and isfile) then return false end; local folder=self.Folder or window.Config.Directory; local path=folder.."/autoload.txt"; if isfile(path) then local name=readfile(path); self._selected=name; return self:Load(name) end return false end
+
+    -- public window methods
+    function window:ApplyTheme(t) for k,v in pairs(t or {}) do if self.Theme[k] then self.Theme[k]=v end end end
+
+    -- === Build default tabs ALWAYS (UI + Config). Also return a blank Main tab for you.
+    local tabs = {}
+    tabs.Main  = window:AddTab("Main")           -- empty; you will use this in your loader
+    tabs.UI    = window:AddTab("UI")
+    tabs.Config= window:AddTab("Config")
+
+    -- UI tab controls (all OFF by default)
+    do
+        local uiL=tabs.UI:Section("HUD / Scene","left")
+        uiL:Toggle({Name="Show FPS HUD",Flag="hud_fps",Default=false,Callback=function(on) window:SetFPSVisible(on) end})
+        uiL:Slider({Name="Blur Strength",Min=0,Max=20,Step=1,Default=16,Flag="blur_strength",Callback=function(v) window:SetBlurPower(getgenv().Payback.Toggles["hud_fps"] and getgenv().Payback.Toggles["hud_fps"].Value and v or v) end})
+        uiL:Slider({Name="Dim Amount",Min=0,Max=1,Step=0.05,Default=.48,Flag="dim_amount",Callback=function(v) window:SetDimAlpha(v) end})
+
+        local uiR=tabs.UI:Section("Accent","right")
+        uiR:ColorPicker({Name="Accent Color",Flag="accent_color",Default=window.Theme.Accent})
+        uiR:Button({Name="Apply Accent",Callback=function()
+            local opt=getgenv().Payback.Options["accent_color"]; if opt and typeof(opt.Value)=="Color3" then window.Theme.Accent=opt.Value end
+            window:Notify({Title="UI",Content="Accent color applied.",Duration=2})
+        end})
+
+        local util=tabs.UI:Section("Utilities","right")
+        util:Button({Name="Unload (remove UI)", Callback=function() window:Unload() end})
+    end
+
+    -- Config tab (embedded manager)
+    local SM = SaveManager:SetFolder(opts.ConfigDir or "Payback-UI")
+    SM:BuildConfigTab(tabs.Config)
+
+    -- autoload (if present) – toggles etc remain OFF unless autoload exists
+    SM:LoadAutoload()
+
+    -- expose a small public API
+    window._Tabs = tabs
+    return window, tabs
+end
+
+-- Expose the library object (module-style)
+return setmetatable({}, PaybackLib)
